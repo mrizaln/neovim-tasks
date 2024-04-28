@@ -2,7 +2,7 @@ local Path = require('plenary.path')
 local utils = require('tasks.utils')
 local scandir = require('plenary.scandir')
 local ProjectConfig = require('tasks.project_config')
-local os = require('ffi').os:lower()
+local ffi_os = require('ffi').os:lower()
 local cmake = {}
 
 --- Parses build dir expression.
@@ -11,7 +11,7 @@ local cmake = {}
 ---@return table
 local function parse_dir(dir, build_type)
   local parsed_dir = dir:gsub('{cwd}', vim.loop.cwd())
-  parsed_dir = parsed_dir:gsub('{os}', os)
+  parsed_dir = parsed_dir:gsub('{os}', ffi_os)
   parsed_dir = parsed_dir:gsub('{build_type}', build_type:lower())
   return Path:new(parsed_dir)
 end
@@ -121,7 +121,85 @@ local function copy_compile_commands()
   local filename = 'compile_commands.json'
   local source = parse_dir(project_config.cmake.build_dir, project_config.cmake.build_type) / filename
   local destination = Path:new(vim.loop.cwd(), filename)
-  source:copy({ destination = destination.filename })
+
+  if ffi_os == 'windows' then
+    source:copy({ destination = destination.filename })
+  else
+    os.execute('ln -sf ' .. source.filename .. ' ' .. destination.filename) -- link instead of copy on *nix
+  end
+end
+
+local conan = {
+  conanfile_exists = function()
+    local cwd = Path:new(vim.loop.cwd())
+    return (cwd / 'conanfile.py'):exists() or (cwd / 'conanfile.txt'):exists()
+  end,
+
+  get_dependencies = function(build_dir, build_type, after)
+    return {
+      cmd = 'conan',
+      args = { 'install', '.', '-of', build_dir.filename, '--build', 'missing', '-s', 'build_type=' .. build_type },
+      after_success = after,
+    }
+  end,
+
+  cmake_preset_name = function(build_dir, which)
+    local found_files = scandir.scan_dir(build_dir.filename, { search_pattern = '.*CMakePresets.json$' })
+    if #found_files == 0 then
+      utils.notify('No CMakePresets generated from conan', vim.log.levels.INFO)
+      return nil
+    end
+
+    local cmake_preset = Path:new(found_files[1])
+    local cmake_preset_json = vim.json.decode(cmake_preset:read())
+    if cmake_preset_json == nil then
+      return nil
+    end
+
+    local vendor = cmake_preset_json['vendor']
+    if vendor == nil then
+      return nil
+    end
+
+    for k, _ in pairs(vendor) do
+      if k == 'conan' then
+        local which_preset = { -- might change in the future
+          configure = 'configurePresets',
+          build = 'buildPresets',
+          test = 'testPresets',
+        }
+
+        local presets = cmake_preset_json[which_preset[which]]
+        if presets == nil or #presets == 0 then
+          return nil
+        elseif #presets == 1 then
+          return presets[1]['name']
+        else -- if multiple presets, ask user to choose
+          local presets_names = {}
+          for _, preset in ipairs(presets) do
+            table.insert(presets_names, preset['name'])
+          end
+          local choice = vim.fn.inputlist(presets_names)
+          return presets[choice]['name']
+        end
+      end
+    end
+
+    utils.notify('CMakePresets not vendored by conan', vim.log.levels.INFO)
+    return nil
+  end,
+}
+
+--- Get dependencies (conan)
+local function conan_get_dependencies(module_config, _)
+  local build_dir = parse_dir(module_config.build_dir, module_config.build_type)
+  if not conan.conanfile_exists() then
+    utils.notify('Conanfile does not exist. Dependencies not managed by conan', vim.log.levels.INFO)
+    return nil
+  end
+
+  utils.notify('Conanfile exists! Installing dependencies...', vim.log.levels.INFO)
+  return conan.get_dependencies(build_dir, module_config.build_type, function() utils.notify('Installing dependencies done!', vim.log.levels.INFO) end)
 end
 
 --- Task
@@ -134,9 +212,30 @@ local function configure(module_config, _)
     return nil
   end
 
+  local args = { '-B', build_dir.filename, '-D', 'CMAKE_BUILD_TYPE=' .. module_config.build_type }
+
+  if conan.conanfile_exists() then
+    if #scandir.scan_dir(build_dir.filename, { depth = 1, add_dirs = true }) == 0 then
+      utils.notify('I detect an existence of a conanfile. Install the dependencies first: `Task start cmake get_deps`', vim.log.levels.ERROR)
+      return nil
+    end
+
+    local cmake_preset_name = conan.cmake_preset_name(build_dir, 'configure')
+    if cmake_preset_name ~= nil then
+      args = { '--preset', cmake_preset_name } -- replace args with cmake preset if it exists
+    else -- if no cmake preset, use conan_toolchain.cmake
+      local toolchain_file = scandir.scan_dir(build_dir.filename, { search_pattern = '.*conan_toolchain.cmake$' })
+      if #toolchain_file == 0 then
+        utils.notify('Failed to find conan_toolchain.cmake file (Install the conan dependencies first)', vim.log.levels.ERROR)
+        return nil
+      end
+      vim.list_extend(args, { '-DCMAKE_TOOLCHAIN_FILE=' .. toolchain_file[1] })
+    end
+  end
+
   return {
     cmd = module_config.cmd,
-    args = { '-B', build_dir.filename, '-D', 'CMAKE_BUILD_TYPE=' .. module_config.build_type },
+    args = args,
     after_success = copy_compile_commands,
   }
 end
@@ -146,8 +245,15 @@ end
 ---@return table
 local function build(module_config, _)
   local build_dir = parse_dir(module_config.build_dir, module_config.build_type)
-
   local args = { '--build', build_dir.filename }
+
+  if conan.conanfile_exists() then
+    local cmake_preset_name = conan.cmake_preset_name(build_dir, 'build')
+    if cmake_preset_name ~= nil then
+      args = { '--build', '--preset', cmake_preset_name } -- replace args with cmake preset if it exists
+    end
+  end
+
   if module_config.target then
     vim.list_extend(args, { '--target', module_config.target })
   end
@@ -164,10 +270,18 @@ end
 ---@return table
 local function build_all(module_config, _)
   local build_dir = parse_dir(module_config.build_dir, module_config.build_type)
+  local args = { '--build', build_dir.filename }
+
+  if conan.conanfile_exists() then
+    local cmake_preset_name = conan.cmake_preset_name(build_dir, 'build')
+    if cmake_preset_name ~= nil then
+      args = { '--build', '--preset', cmake_preset_name } -- replace args with cmake preset if it exists
+    end
+  end
 
   return {
     cmd = module_config.cmd,
-    args = { '--build', build_dir.filename },
+    args = args,
     after_success = copy_compile_commands,
   }
 end
@@ -197,9 +311,15 @@ local function run(module_config, _)
     return nil
   end
 
+  local args_string = vim.fn.input('Arguments: ')
+  local args = vim.split(args_string, ' +')
+
+  utils.notify(('Launching: %s %s'):format(target_path.filename, args_string), vim.log.levels.INFO)
+
   return {
     cmd = target_path.filename,
     cwd = target_path:parent().filename,
+    args = args,
   }
 end
 
@@ -209,8 +329,7 @@ end
 local function debug(module_config, _)
   if module_config.build_type ~= 'Debug' and module_config.build_type ~= 'RelWithDebInfo' then
     utils.notify(
-      string.format('For debugging your "build_type" param should be set to "Debug" or "RelWithDebInfo", but your current build type is "%s"'),
-      module_config.build_type,
+      string.format('For debugging your "build_type" param should be set to "Debug" or "RelWithDebInfo", but your current build type is "%s"', module_config.build_type),
       vim.log.levels.ERROR
     )
     return nil
@@ -245,7 +364,7 @@ local function open_build_dir(module_config, _)
   local build_dir = parse_dir(module_config.build_dir, module_config.build_type)
 
   return {
-    cmd = os == 'windows' and 'start' or 'xdg-open',
+    cmd = ffi_os == 'windows' and 'start' or 'xdg-open',
     args = { build_dir.filename },
     ignore_stdout = true,
     ignore_stderr = true,
@@ -260,6 +379,7 @@ cmake.params = {
 }
 cmake.condition = function() return Path:new('CMakeLists.txt'):exists() end
 cmake.tasks = {
+  get_deps = conan_get_dependencies,
   configure = configure,
   build = build,
   build_all = build_all,
