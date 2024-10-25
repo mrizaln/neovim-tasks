@@ -12,7 +12,7 @@ local cmake = {}
 local function parse_dir(dir, build_type)
   local parsed_dir = dir:gsub('{cwd}', vim.loop.cwd())
   parsed_dir = parsed_dir:gsub('{os}', ffi_os)
-  parsed_dir = parsed_dir:gsub('{build_type}', build_type:lower())
+  parsed_dir = parsed_dir:gsub('{build_type}', build_type)
   return Path:new(parsed_dir)
 end
 
@@ -135,10 +135,10 @@ local conan = {
     return (cwd / 'conanfile.py'):exists() or (cwd / 'conanfile.txt'):exists()
   end,
 
-  get_dependencies = function(build_dir, build_type, after)
+  get_dependencies = function(build_type, after)
     return {
       cmd = 'conan',
-      args = { 'install', '.', '-of', build_dir.filename, '--build', 'missing', '-s', 'build_type=' .. build_type },
+      args = { 'install', '.', '--build', 'missing', '-s', 'build_type=' .. build_type },
       after_success = after,
     }
   end,
@@ -192,14 +192,13 @@ local conan = {
 
 --- Get dependencies (conan)
 local function conan_get_dependencies(module_config, _)
-  local build_dir = parse_dir(module_config.build_dir, module_config.build_type)
   if not conan.conanfile_exists() then
     utils.notify('Conanfile does not exist. Dependencies not managed by conan', vim.log.levels.INFO)
     return nil
   end
 
   utils.notify('Conanfile exists! Installing dependencies...', vim.log.levels.INFO)
-  return conan.get_dependencies(build_dir, module_config.build_type, function() utils.notify('Installing dependencies done!', vim.log.levels.INFO) end)
+  return conan.get_dependencies(module_config.build_type, function() utils.notify('Installing dependencies done!', vim.log.levels.INFO) end)
 end
 
 --- Task
